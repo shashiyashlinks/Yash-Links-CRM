@@ -61,6 +61,21 @@ import {
 } from 'recharts';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { 
+  collection, 
+  addDoc, 
+  getDocs, 
+  updateDoc, 
+  deleteDoc, 
+  doc, 
+  query, 
+  where, 
+  orderBy, 
+  onSnapshot,
+  serverTimestamp,
+  Timestamp
+} from 'firebase/firestore';
+import { db, analytics } from './lib/firebase';
 
 // --- Utils ---
 function cn(...inputs: ClassValue[]) {
@@ -79,7 +94,7 @@ const formatCurrency = (val: number) => {
 type View = 'dashboard' | 'leads' | 'properties' | 'search' | 'matchMaker';
 
 interface Lead {
-  id: number;
+  id: string;
   name: string;
   phone: string;
   email: string;
@@ -89,14 +104,15 @@ interface Lead {
   budget_max: number;
   preferred_location: string;
   property_type: string;
+  bhk?: number;
   status: string;
   agent_name?: string;
   notes: string;
-  created_at: string;
+  created_at: any;
 }
 
 interface Property {
-  id: number;
+  id: string;
   property_id_code: string;
   project_name: string;
   location: string;
@@ -262,8 +278,8 @@ export default function App() {
   const [isPropertyModalOpen, setIsPropertyModalOpen] = useState(false);
   const [editingLead, setEditingLead] = useState<Lead | null>(null);
   const [editingProperty, setEditingProperty] = useState<Property | null>(null);
-  const [isDeleting, setIsDeleting] = useState<number | null>(null);
-  const [selectedPropertyIds, setSelectedPropertyIds] = useState<number[]>([]);
+  const [isDeleting, setIsDeleting] = useState<string | null>(null);
+  const [selectedPropertyIds, setSelectedPropertyIds] = useState<string[]>([]);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
 
   const addToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -276,41 +292,133 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    try {
-      let res;
-      if (view === 'dashboard') {
-        res = await fetch('/api/stats');
-      } else if (view === 'leads') {
-        res = await fetch('/api/leads');
-      } else if (view === 'properties') {
-        res = await fetch('/api/properties');
-      } else if (view === 'matchMaker') {
-        res = await fetch('/api/matches');
-      }
-
-      if (res && res.ok) {
-        const data = await res.json();
-        if (view === 'dashboard') setStats(data);
-        else if (view === 'leads') setLeads(data);
-        else if (view === 'properties') setProperties(data);
-        else if (view === 'matchMaker') setMatches(data);
-      } else {
-        console.error(`Fetch failed for ${view}:`, res?.status);
-        addToast(`Failed to fetch ${view} data`, "error");
-      }
-    } catch (err) {
-      console.error("Fetch error:", err);
-      addToast("Failed to fetch data", "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [view]);
-
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    setLoading(true);
+    const qLeads = query(collection(db, 'leads'), orderBy('created_at', 'desc'));
+    const unsubscribeLeads = onSnapshot(qLeads, (snapshot) => {
+      const leadsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Lead[];
+      setLeads(leadsData);
+      setLoading(false);
+    }, (error) => {
+      console.error("Leads sync error:", error);
+      addToast("Failed to sync leads", "error");
+      setLoading(false);
+    });
+
+    const qInventory = query(collection(db, 'inventory'), orderBy('project_name', 'asc'));
+    const unsubscribeInventory = onSnapshot(qInventory, (snapshot) => {
+      const inventoryData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Property[];
+      setProperties(inventoryData);
+    }, (error) => {
+      console.error("Inventory sync error:", error);
+      addToast("Failed to sync inventory", "error");
+    });
+
+    return () => {
+      unsubscribeLeads();
+      unsubscribeInventory();
+    };
+  }, []);
+
+  // Calculate stats locally from synced data
+  useEffect(() => {
+    const totalLeads = leads.length;
+    const activeLeads = leads.filter(l => !['Closed', 'Lost'].includes(l.status)).length;
+    const closedDeals = leads.filter(l => l.status === 'Closed').length;
+    const availableProperties = properties.filter(p => p.status === 'Available').length;
+    
+    const recentLeads = [...leads].sort((a, b) => {
+      const dateA = a.created_at?.seconds || 0;
+      const dateB = b.created_at?.seconds || 0;
+      return dateB - dateA;
+    }).slice(0, 5);
+
+    const statusCounts: Record<string, number> = {};
+    leads.forEach(l => {
+      statusCounts[l.status] = (statusCounts[l.status] || 0) + 1;
+    });
+    const statusDistribution = Object.entries(statusCounts).map(([name, value]) => ({ name, value }));
+
+    setStats({
+      totalLeads,
+      activeLeads,
+      closedDeals,
+      availableProperties,
+      recentLeads,
+      statusDistribution
+    });
+  }, [leads, properties]);
+
+  // Calculate matches locally from synced data
+  useEffect(() => {
+    const activeLeads = leads.filter(l => !['Closed', 'Lost'].includes(l.status));
+    const availableInventory = properties.filter(p => p.status === 'Available');
+
+    const generatedMatches = activeLeads.map(lead => {
+      const leadMatches = availableInventory.map(prop => {
+        let score = 0;
+
+        // 1. Category Match (Sale/Rent/Lease) - Critical
+        if (lead.interest_type === prop.category) {
+          score += 20;
+        }
+
+        // 2. Property Type Match
+        if (lead.property_type && prop.property_type && 
+            lead.property_type.toLowerCase() === prop.property_type.toLowerCase()) {
+          score += 20;
+        }
+
+        // 3. BHK Match
+        if (lead.bhk && prop.bhk && Number(lead.bhk) === prop.bhk) {
+          score += 20;
+        }
+
+        // 4. Location Match
+        if (lead.preferred_location && prop.location && 
+            (prop.location.toLowerCase().includes(lead.preferred_location.toLowerCase()) || 
+             lead.preferred_location.toLowerCase().includes(prop.location.toLowerCase()))) {
+          score += 20;
+        }
+
+        // 5. Budget Match
+        const price = prop.category === 'Sale' ? prop.price : prop.rent_amount;
+        if (price > 0) {
+          if (lead.budget_min && lead.budget_max) {
+            if (price >= lead.budget_min && price <= lead.budget_max) {
+              score += 20;
+            } else if (price >= lead.budget_min * 0.8 && price <= lead.budget_max * 1.2) {
+              score += 10; // Close budget
+            }
+          } else if (lead.budget_max && price <= lead.budget_max) {
+            score += 20;
+          } else if (lead.budget_min && price >= lead.budget_min) {
+            score += 20;
+          }
+        }
+
+        return {
+          property: prop,
+          score: score
+        };
+      })
+      .filter(m => m.score >= 40) // Only show reasonable matches
+      .sort((a, b) => b.score - a.score);
+
+      return {
+        lead,
+        matches: leadMatches
+      };
+    }).filter(m => m.matches.length > 0);
+
+    setMatches(generatedMatches);
+  }, [leads, properties]);
 
   useEffect(() => {
     if (!isPropertyModalOpen) {
@@ -325,22 +433,26 @@ export default function App() {
       addToast("Please enter at least 2 characters to search", "info");
       return;
     }
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-      if (!res.ok) throw new Error("Search failed");
-      const data = await res.json();
-      setSearchResults(data);
-      setView('search');
-    } catch (err) {
-      console.error(err);
-      addToast("Failed to fetch search data", "error");
-    } finally {
-      setLoading(false);
-    }
+    
+    const searchTerm = q.toLowerCase();
+    const filteredLeads = leads.filter(l => 
+      l.name.toLowerCase().includes(searchTerm) || 
+      l.phone.toLowerCase().includes(searchTerm) || 
+      l.email.toLowerCase().includes(searchTerm) ||
+      l.preferred_location.toLowerCase().includes(searchTerm)
+    );
+    
+    const filteredProperties = properties.filter(p => 
+      p.project_name.toLowerCase().includes(searchTerm) || 
+      p.location.toLowerCase().includes(searchTerm) || 
+      p.property_id_code.toLowerCase().includes(searchTerm)
+    );
+
+    setSearchResults({ leads: filteredLeads, properties: filteredProperties });
+    setView('search');
   };
 
-  const togglePropertySelection = (id: number) => {
+  const togglePropertySelection = (id: string) => {
     setSelectedPropertyIds(prev => 
       prev.includes(id) ? prev.filter(pId => pId !== id) : [...prev, id]
     );
@@ -383,28 +495,24 @@ export default function App() {
     }
   };
 
-  const handleDeleteLead = async (id: number) => {
+  const handleDeleteLead = async (id: string) => {
     if (!confirm("Are you sure you want to delete this lead?")) return;
     try {
-      const res = await fetch(`/api/leads/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        addToast("Lead deleted successfully", "success");
-        fetchData();
-      }
+      await deleteDoc(doc(db, 'leads', id));
+      addToast("Lead deleted successfully", "success");
     } catch (err) {
+      console.error(err);
       addToast("Failed to delete lead", "error");
     }
   };
 
-  const handleDeleteProperty = async (id: number) => {
+  const handleDeleteProperty = async (id: string) => {
     if (!confirm("Are you sure you want to delete this property?")) return;
     try {
-      const res = await fetch(`/api/properties/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        addToast("Property deleted successfully", "success");
-        fetchData();
-      }
+      await deleteDoc(doc(db, 'inventory', id));
+      addToast("Property deleted successfully", "success");
     } catch (err) {
+      console.error(err);
       addToast("Failed to delete property", "error");
     }
   };
@@ -415,25 +523,30 @@ export default function App() {
     const data = Object.fromEntries(formData.entries());
     
     try {
-      const url = editingLead ? `/api/leads/${editingLead.id}` : '/api/leads';
-      const method = editingLead ? 'PUT' : 'POST';
-      
-      const res = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      
-      if (res.ok) {
-        addToast(editingLead ? "Lead updated" : "Lead created", "success");
-        setIsLeadModalOpen(false);
-        setEditingLead(null);
-        fetchData();
+      if (editingLead) {
+        await updateDoc(doc(db, 'leads', editingLead.id), {
+          ...data,
+          budget_min: Number(data.budget_min),
+          budget_max: Number(data.budget_max),
+          bhk: data.bhk ? Number(data.bhk) : null,
+          updated_at: serverTimestamp()
+        });
+        addToast("Lead updated", "success");
       } else {
-        const errorData = await res.json();
-        addToast(errorData.error || "Failed to save lead", "error");
+        await addDoc(collection(db, 'leads'), {
+          ...data,
+          budget_min: Number(data.budget_min),
+          budget_max: Number(data.budget_max),
+          bhk: data.bhk ? Number(data.bhk) : null,
+          created_at: serverTimestamp(),
+          status: data.status || 'New'
+        });
+        addToast("Lead created", "success");
       }
+      setIsLeadModalOpen(false);
+      setEditingLead(null);
     } catch (err) {
+      console.error(err);
       addToast("Failed to save lead", "error");
     }
   };
@@ -443,32 +556,38 @@ export default function App() {
     const formData = new FormData(e.currentTarget);
     const data = Object.fromEntries(formData.entries());
     
-    // Use the uploaded image if available
     if (imagePreview) {
       data.image_url = imagePreview;
     }
 
     try {
-      const url = editingProperty ? `/api/properties/${editingProperty.id}` : '/api/properties';
-      const method = editingProperty ? 'PUT' : 'POST';
-      
-      const res = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      
-      if (res.ok) {
-        addToast(editingProperty ? "Property updated" : "Property created", "success");
-        setIsPropertyModalOpen(false);
-        setEditingProperty(null);
-        setImagePreview(null);
-        fetchData();
+      const propertyData = {
+        ...data,
+        bhk: data.bhk ? Number(data.bhk) : 0,
+        sqft: data.sqft ? Number(data.sqft) : 0,
+        price: data.price ? Number(data.price) : 0,
+        rent_amount: data.rent_amount ? Number(data.rent_amount) : 0,
+        updated_at: serverTimestamp()
+      };
+
+      if (editingProperty) {
+        await updateDoc(doc(db, 'inventory', editingProperty.id), propertyData);
+        addToast("Property updated", "success");
       } else {
-        const errorData = await res.json();
-        addToast(errorData.error || "Failed to save property", "error");
+        const idCode = `PROP-${Date.now().toString().slice(-6)}`;
+        await addDoc(collection(db, 'inventory'), {
+          ...propertyData,
+          property_id_code: idCode,
+          created_at: serverTimestamp(),
+          status: data.status || 'Available'
+        });
+        addToast("Property created", "success");
       }
+      setIsPropertyModalOpen(false);
+      setEditingProperty(null);
+      setImagePreview(null);
     } catch (err) {
+      console.error(err);
       addToast("Failed to save property", "error");
     }
   };
@@ -620,9 +739,9 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between">
                     <h3 className="text-xl font-bold text-slate-900">Overview</h3>
-                    <button onClick={fetchData} className="p-2 text-slate-500 hover:bg-slate-100 rounded-lg transition-colors">
+                    <div className="p-2 text-slate-300 opacity-50">
                       <RefreshCw size={18} />
-                    </button>
+                    </div>
                   </div>
 
                   {/* Stats Grid */}
@@ -1069,9 +1188,9 @@ export default function App() {
                       <h3 className="text-xl font-bold text-slate-900">Match Maker</h3>
                       <p className="text-sm text-slate-500">Automatically matching leads with available inventory</p>
                     </div>
-                    <button onClick={fetchData} className="p-2 text-slate-500 hover:bg-slate-100 rounded-lg transition-colors">
+                    <div className="p-2 text-slate-300 opacity-50">
                       <RefreshCw size={18} />
-                    </button>
+                    </div>
                   </div>
 
                   {matches.length === 0 ? (
@@ -1252,9 +1371,15 @@ export default function App() {
               <input name="budget_max" type="number" defaultValue={editingLead?.budget_max} className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500" />
             </div>
           </div>
-          <div className="space-y-1">
-            <label className="text-xs font-bold text-slate-500 uppercase">Preferred Location</label>
-            <input name="preferred_location" defaultValue={editingLead?.preferred_location} className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500" />
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 uppercase">Preferred Location</label>
+              <input name="preferred_location" defaultValue={editingLead?.preferred_location} className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 uppercase">BHK Requirement</label>
+              <input name="bhk" type="number" defaultValue={editingLead?.bhk} placeholder="e.g. 3" className="w-full px-4 py-2 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500" />
+            </div>
           </div>
           <div className="space-y-1">
             <label className="text-xs font-bold text-slate-500 uppercase">Status</label>
